@@ -104,6 +104,14 @@ builtin_cppflags += $(ALSA_CFLAGS)
 builtin_ldadd += $(ALSA_LIBS)
 endif
 
+if JACKMIDI
+builtin_modules += jackmidi
+builtin_sources += profiles/jackmidi/midi.c \
+			profiles/jackmidi/libmidi.h
+builtin_cppflags += $(JACK_CFLAGS)
+builtin_ldadd += $(JACK_LIBS)
+endif
+
 builtin_modules += battery
 builtin_sources += profiles/battery/battery.c
 

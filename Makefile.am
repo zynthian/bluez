@@ -730,6 +730,7 @@ EXTRA_DIST += $(manual_pages) $(patsubst %.1,%.rst, \
 DISTCHECK_CONFIGURE_FLAGS = --disable-datafiles --enable-library \
 						--enable-health \
 						--enable-midi \
+						--enable-jackmidi \
 						--enable-manpages \
 						--enable-android \
 						--enable-mesh \

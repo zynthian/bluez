@@ -272,6 +272,14 @@ if (test "${enable_midi}" = "yes"); then
 	PKG_CHECK_MODULES(ALSA, alsa)
 fi
 
+AC_ARG_ENABLE(jackmidi, AS_HELP_STRING([--enable-jackmidi],
+                [enable JACKMIDI support]), [enable_jackmidi=${enableval}])
+AM_CONDITIONAL(JACKMIDI, test "${enable_jackmidi}" = "yes")
+
+if (test "${enable_jackmidi}" = "yes"); then
+	PKG_CHECK_MODULES(JACK, jack)
+fi
+
 AC_ARG_ENABLE(obex, AS_HELP_STRING([--disable-obex],
 		[disable OBEX profile support]), [enable_obex=${enableval}])
 if (test "${enable_obex}" != "no"); then

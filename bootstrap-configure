@@ -24,6 +24,7 @@ fi
 		--enable-sixaxis \
 		--enable-hid2hci \
 		--enable-midi \
+		--enable-jackmidi \
 		--enable-mesh \
 		--enable-btpclient \
 		--enable-logger \
