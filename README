@@ -308,9 +308,9 @@ For a working system, certain configuration options need to be enabled:
 
 		This option enable MIDI support via JACK2.
 
-		By default midi plugin is disabled since it still considered
-		experimental. When bluetoothd will create a new JACK2 client
-		and input and output ports for each device connected that supports
+		By default jackmidi plugin is disabled since it still considered
+		experimental. When bluetoothd will create a single JACK2 client
+		with input and output ports for each device connected that supports
 		the MIDI GATT primary service.
 
 		The plugin is built into bluetoothd therefore it does not need
