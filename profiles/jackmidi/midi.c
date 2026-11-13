@@ -446,7 +446,7 @@ static int midi_accept(struct btd_service *service)
 	midi->client = bt_gatt_client_ref(client);
 
 	for (int i = 0; i < MAX_DEVICES; ++i) {
-		if (midis[0] != NULL)
+		if (midis[i] != NULL)
 			continue;
 		midis[i] = midi;
 		break;
