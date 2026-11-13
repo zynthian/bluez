@@ -42,19 +42,35 @@
 
 //#include "libmidi.h"
 
-#define JACK_RINGBUFFER_SIZE 1024 // Quantity of bytes in each ble<>jack buffer
+#define JACK_RINGBUFFER_SIZE 4096 // Quantity of bytes in each ble<>jack buffer
+#define MIDI_MAX_EVENT_SIZE 1024 // Largest MIDI message (i.e. SysEx) passed between BLE and jack
+#define BLE_MIDI_MAX_PACKET 512 // Largest BLE-MIDI packet built (ATT MTU - 3, capped)
+#define BLE_MIDI_DEFAULT_PACKET 20 // BLE-MIDI packet size for the default ATT MTU (23 - 3)
 #define MAX_DEVICES 32 // Maximum quantity of concurrent BLE MIDI devices
 #define MIDI_UUID "03B80E5A-EDE8-4B33-A751-6CE34EC4C700"
 #define MIDI_IO_UUID "7772E5DB-3868-4112-A1A9-F2669D106BF3"
 
+/*
+ * Each ble<>jack ringbuffer holds whole MIDI messages, each stored as a
+ * uint16_t length followed by the message bytes.
+ */
 
 struct midi_read_parser {
-	uint8_t rstatus;                 // running status byte
-	uint8_t rlen;                    // quantity of bytes in the running status message
-	int64_t rtime;                   // last reader's real time
-	int16_t timestamp;               // last MIDI-BLE timestamp
-	int8_t timestamp_low;            // MIDI-BLE timestampLow from the current packet
-	int8_t timestamp_high;           // MIDI-BLE timestampHigh from the current packet
+	uint8_t rstatus;                 // running status byte (0 if none)
+	uint8_t msg[3];                  // short message being assembled
+	uint8_t msg_pos;                 // quantity of bytes in msg
+	uint8_t msg_len;                 // expected quantity of bytes in msg
+	bool sysex;                      // true between F0 and F7
+	bool sysex_overflow;             // current SysEx is too long - drop it
+	uint16_t sysex_len;              // quantity of bytes in sysex_buf
+	uint8_t sysex_buf[MIDI_MAX_EVENT_SIZE]; // SysEx being assembled across BLE packets
+};
+
+struct ble_midi_packet {
+	uint8_t buf[BLE_MIDI_MAX_PACKET]; // buf[0] is the header byte
+	uint16_t len;                    // quantity of bytes in buf
+	uint16_t max;                    // maximum packet size for this connection
+	uint8_t ts;                      // timestamp byte preceding each status byte
 };
 
 struct midi {
@@ -74,158 +90,277 @@ struct midi {
 
 	/* MIDI parser*/
 	struct midi_read_parser midi_in;
-};
 
-struct midi_event_t {
-	uint8_t len;
-	uint8_t cmd;
-	uint8_t val1;
-	uint8_t val2;
+	/* Quantity of jack messages dropped since last reported (jack thread increments) */
+	unsigned int playback_dropped;
 };
 
 static struct midi * midis[MAX_DEVICES]; // Static array of pointers to midi structures
 static jack_client_t * jack_client = NULL;
 static bool jack_mutex = false;
 
+/* Quantity of bytes in a MIDI message including its status byte (0 for SysEx) */
+static uint8_t midi_msg_len(uint8_t status)
+{
+	switch (status) {
+		case 0x80 ... 0xBF:
+		case 0xE0 ... 0xEF:
+		case 0xF2: // Song position pointer
+			return 3;
+		case 0xC0 ... 0xDF:
+		case 0xF1: // Timecode quarter frame
+		case 0xF3: // Song select
+			return 2;
+		case 0xF0:
+			return 0;
+		default:
+			return 1; // Tune request, undefined, stray EOX, realtime
+	}
+}
+
+/* Queue a whole MIDI message in a ble<>jack ringbuffer. Returns false (and
+   queues nothing) if it does not fit. */
+static bool rb_queue_msg(jack_ringbuffer_t *rb, const uint8_t *data, uint16_t len)
+{
+	if (!rb || !len || jack_ringbuffer_write_space(rb) < sizeof(len) + len)
+		return false;
+	jack_ringbuffer_write(rb, (const char *)&len, sizeof(len));
+	jack_ringbuffer_write(rb, (const char *)data, len);
+	return true;
+}
+
+/* Length of the next whole message in a ble<>jack ringbuffer, 0 if none */
+static uint16_t rb_next_msg_len(jack_ringbuffer_t *rb)
+{
+	uint16_t len;
+
+	if (!rb || jack_ringbuffer_peek(rb, (char *)&len, sizeof(len)) != sizeof(len))
+		return 0;
+	if (jack_ringbuffer_read_space(rb) < sizeof(len) + len)
+		return 0; // Writer has not finished queuing it
+	return len;
+}
+
+/* --- jack -> BLE --- */
+
+static void ble_packet_flush(struct midi *midi, struct ble_midi_packet *pkt)
+{
+	if (pkt->len > 1 && !bt_gatt_client_write_without_response(midi->client,
+						midi->midi_io_handle, false, pkt->buf, pkt->len))
+		error("MIDI I/O: failed to write %u byte BLE-MIDI packet", pkt->len);
+	pkt->len = 1; // Keep the header for the next packet
+}
+
+/* Start a new packet unless n more bytes fit in this one */
+static void ble_packet_reserve(struct midi *midi, struct ble_midi_packet *pkt, uint16_t n)
+{
+	if (pkt->len + n > pkt->max)
+		ble_packet_flush(midi, pkt);
+}
+
+static void ble_packet_add_short(struct midi *midi, struct ble_midi_packet *pkt,
+                                 const uint8_t *msg, uint8_t len)
+{
+	// Status byte is always sent (no running status) so each message is self-contained
+	ble_packet_reserve(midi, pkt, len + 1);
+	pkt->buf[pkt->len++] = pkt->ts;
+	memcpy(pkt->buf + pkt->len, msg, len);
+	pkt->len += len;
+}
+
+/* SysEx per BLE-MIDI 1.0: timestamp, F0, data... split over as many packets as
+   required, each continuation packet being header + data with no timestamp,
+   then timestamp, F7. */
+static void ble_packet_add_sysex(struct midi *midi, struct ble_midi_packet *pkt,
+                                 const uint8_t *msg, uint16_t len)
+{
+	bool eox = len > 1 && msg[len - 1] == 0xF7;
+	uint16_t end = eox ? len - 1 : len;
+
+	ble_packet_reserve(midi, pkt, 3); // Timestamp, F0, first data byte
+	pkt->buf[pkt->len++] = pkt->ts;
+	pkt->buf[pkt->len++] = 0xF0;
+	for (uint16_t i = 1; i < end; ++i) {
+		if (pkt->len >= pkt->max)
+			ble_packet_flush(midi, pkt);
+		pkt->buf[pkt->len++] = msg[i];
+	}
+	if (eox) {
+		ble_packet_reserve(midi, pkt, 2);
+		pkt->buf[pkt->len++] = pkt->ts;
+		pkt->buf[pkt->len++] = 0xF7;
+	}
+}
+
 static bool midi_write_cb(struct io *io, void *user_data)
 {
-	// Called by main loop when fd is ready
-	// Handle MIDI messages received from other jack clients - send to bluetooth device
-	//!@todo Use timetamps - currently always set to zero
-	//!@todo Support sysex - currently silently ignored
-	
+	// Called by main loop when the jack process thread signals the eventfd
+	// Send MIDI messages received from other jack clients to the bluetooth device
+
 	struct midi *midi = user_data;
 	if (!midi || !midi->playback_buffer)
 		return false;
-	int err;
-	uint64_t val;
-	uint8_t ev[4];
-	uint8_t count, ev_len, cmd, rstatus = 0;
-	while ((err = read(midi->fd, &val, sizeof(uint64_t))) > 0) {
-		// jack process thread has signalled there is data available in this BLE MIDI ringbuffer
-		size_t len = jack_ringbuffer_read_space(midi->playback_buffer);
-		char buffer[len + 1];
-		size_t pos = 0;
-		buffer[pos++] = 0x80; // Header / timestamp high
-		for (int i = 0; i < val; ++i) {
-			jack_ringbuffer_read(midi->playback_buffer, &ev_len, 1);
-			jack_ringbuffer_read(midi->playback_buffer, &cmd, 1);
-			if (cmd != rstatus) {
-				buffer[pos++] = 0x80; // Timestamp low
-				buffer[pos++] = cmd;
-				if (cmd < 0x80 || cmd > 0xEF)
-					rstatus = 0;
-				else
-					rstatus = cmd;
-			}
-			pos += jack_ringbuffer_read(midi->playback_buffer, buffer + pos, ev_len - 1);
-		}
-		/*
-		printf("midi_write_cb read %lu MIDI message. %d bytes buffered: ", val, pos);
-		for(int i = 0; i < pos; ++i)
-			printf("%02X ", buffer[i]);
-		printf("\n");
-		*/
 
-		bt_gatt_client_write_without_response(midi->client,
-							midi->midi_io_handle,
-							false,
-							buffer,
-							pos);
+	uint64_t val;
+	while (read(midi->fd, &val, sizeof(val)) > 0)
+		; // Clear the eventfd - the ringbuffer is drained regardless of the count
+
+	unsigned int dropped = __atomic_exchange_n(&midi->playback_dropped, 0, __ATOMIC_RELAXED);
+	if (dropped)
+		warn("MIDI I/O: dropped %u jack MIDI messages (too long or buffer full)", dropped);
+
+	struct ble_midi_packet pkt;
+	uint16_t mtu = bt_gatt_client_get_mtu(midi->client);
+	pkt.max = mtu > 23 ? MIN(mtu - 3, BLE_MIDI_MAX_PACKET) : BLE_MIDI_DEFAULT_PACKET;
+	uint16_t ts = (g_get_monotonic_time() / 1000) & 0x1FFF; // 13-bit milliseconds
+	pkt.buf[0] = 0x80 | (ts >> 7);
+	pkt.ts = 0x80 | (ts & 0x7F);
+	pkt.len = 1;
+
+	uint8_t msg[MIDI_MAX_EVENT_SIZE];
+	uint16_t len;
+	while ((len = rb_next_msg_len(midi->playback_buffer))) {
+		jack_ringbuffer_read_advance(midi->playback_buffer, sizeof(len));
+		jack_ringbuffer_read(midi->playback_buffer, (char *)msg, len);
+		if (msg[0] == 0xF0)
+			ble_packet_add_sysex(midi, &pkt, msg, len);
+		else if ((msg[0] & 0x80) && len >= midi_msg_len(msg[0]))
+			ble_packet_add_short(midi, &pkt, msg, midi_msg_len(msg[0]));
+		else
+			DBG("MIDI I/O: ignoring malformed %u byte jack MIDI message", len);
 	}
+	ble_packet_flush(midi, &pkt);
 	return true;
+}
+
+/* --- BLE -> jack --- */
+
+static void midi_in_emit(struct midi *midi, const uint8_t *data, uint16_t len)
+{
+	if (!rb_queue_msg(midi->capture_buffer, data, len))
+		warn("MIDI I/O: jack capture buffer full - dropped %u byte message", len);
+}
+
+static void midi_in_status(struct midi *midi, uint8_t status)
+{
+	struct midi_read_parser *p = &midi->midi_in;
+
+	if (status >= 0xF8) {
+		// Realtime - may appear anywhere, including inside SysEx
+		midi_in_emit(midi, &status, 1);
+		return;
+	}
+
+	if (p->sysex) {
+		p->sysex = false;
+		if (status == 0xF7) {
+			if (p->sysex_overflow) {
+				warn("MIDI I/O: dropped SysEx longer than %d bytes", MIDI_MAX_EVENT_SIZE);
+			} else {
+				p->sysex_buf[p->sysex_len++] = 0xF7;
+				midi_in_emit(midi, p->sysex_buf, p->sysex_len);
+			}
+			return;
+		}
+		warn("MIDI I/O: dropped SysEx interrupted by status 0x%02X", status);
+		// Handle the interrupting status byte below
+	}
+
+	p->msg_pos = 0;
+	if (status == 0xF0) {
+		p->sysex = true;
+		p->sysex_overflow = false;
+		p->sysex_buf[0] = 0xF0;
+		p->sysex_len = 1;
+		p->rstatus = 0;
+		return;
+	}
+	if (status == 0xF7)
+		return; // EOX without SysEx
+
+	p->rstatus = status < 0xF0 ? status : 0; // System Common cancels running status
+	p->msg[0] = status;
+	p->msg_len = midi_msg_len(status);
+	p->msg_pos = 1;
+	if (p->msg_len == 1) {
+		midi_in_emit(midi, p->msg, 1);
+		p->msg_pos = 0;
+	}
+}
+
+static void midi_in_data(struct midi *midi, uint8_t data)
+{
+	struct midi_read_parser *p = &midi->midi_in;
+
+	if (p->sysex) {
+		// Leave room for F7
+		if (p->sysex_len < MIDI_MAX_EVENT_SIZE - 1)
+			p->sysex_buf[p->sysex_len++] = data;
+		else
+			p->sysex_overflow = true;
+		return;
+	}
+	if (p->msg_pos == 0) {
+		if (!p->rstatus)
+			return; // Data byte without status
+		p->msg[0] = p->rstatus;
+		p->msg_len = midi_msg_len(p->rstatus);
+		p->msg_pos = 1;
+	}
+	p->msg[p->msg_pos++] = data;
+	if (p->msg_pos >= p->msg_len) {
+		midi_in_emit(midi, p->msg, p->msg_len);
+		p->msg_pos = 0;
+	}
 }
 
 static void midi_io_notify_cb(uint16_t value_handle, const uint8_t *data,
                              uint16_t length, void *user_data)
 {
-	/* Handle message received from BLE device - send to jack port
-		First byte is always a header including the most significant 6 bits of the BLE timestamp
-		MIDI Command bytes are preceded with BLE timestamp least significant 7 bits
-		Sysex continuation does not have a preceding timestamp
-		Running status is only supported within a single BLE packet
+	/* Handle a BLE-MIDI packet received from the BLE device - send to jack port
+		First byte is a header (bit 7 set) holding the timestamp high bits
+		Each status byte is preceded by a timestamp byte (bit 7 set)
+		Running status data may follow, with or without its own timestamp
+		SysEx may span packets: continuation packets carry data straight
+		after the header, and F7 is preceded by its own timestamp
+		Timestamps are ignored - messages are sent to jack as they arrive
 	*/
 	struct midi *midi = user_data;
 	if (!midi || !midi->capture_buffer)
 		return;
-	struct midi_read_parser *parser = &(midi->midi_in);
+	struct midi_read_parser *p = &midi->midi_in;
 
-	if (length < 3) {
-		warn("MIDI I/O: Wrong packet format: length is %u bytes but it should "
-		     "be at least 3 bytes", length);
+	if (length < 2 || !(data[0] & 0x80)) {
+		warn("MIDI I/O: invalid BLE-MIDI packet (%u bytes)", length);
 		return;
 	}
 
-	parser->timestamp_high = ((data[0]) & 0b111111) << 7;
-	uint16_t offset = 1;
-	struct midi_event_t ev;
-	//!@todo Reset running status
+	p->msg_pos = 0; // A short message may not span packets
 
-	while (offset < length) {
-		if (data[offset] & 0x80) {
-			// Timestamp
-			parser->timestamp_low = data[offset] & 0x7F;
-			//!@todo Do something with timestamp
-			if (++offset >= length) {
-				error("Timestamp without MIDI command");
-				break;
-			}
-			if (data[offset] & 0x80) {
-				// MIDI Command
-			} else {
-				// Sysex continuation
-			}
+	for (uint16_t i = 1; i < length; ++i) {
+		uint8_t b = data[i];
+		if (!(b & 0x80)) {
+			midi_in_data(midi, b); // SysEx data or running status data
+			continue;
 		}
-
-		switch (data[offset]) {
-			case 0xF8 ... 0xFF:
-				// Realtime messages
-				ev.len = 1;
-				ev.cmd = data[offset++];
-				break;
-			case 0xF0: // SysEx Start - pass all data until Sysex End
-			case 0xF7: /* SysEx End */
-				parser->rstatus = data[offset];
-				parser->rlen = 1;
-				ev.len = 1;
-				ev.cmd = data[offset++];
-				break;
-			case 0xF1: // Timecode quarter frame
-			case 0xF3: // Song select
-				// System Common 2 byte messages
-				ev.len = 2;
-				ev.cmd = data[offset++];
-				break;
-			case 0xF2: // Song position pointer
-				// System Common 3 byte messages
-				ev.len = 3;
-				ev.cmd = data[offset++];
-				break;
-			case 0xC0 ... 0xDF:
-				// Channel messages with 1 byte parameter
-				parser->rstatus = data[offset];
-				parser->rlen = 2;
-				ev.len = 2;
-				ev.cmd = data[offset++];
-				break;
-			case 0x80 ... 0xBF:
-			case 0xE0 ... 0xEF:
-				// Channel messages with 2 byte parameters
-				parser->rstatus = data[offset];
-				parser->rlen = 3;
-				ev.len = 3;
-				ev.cmd = data[offset++];
-				break;
-			default:
-				ev.len = parser->rlen;
-				if (parser->rstatus == 0xF0)
-					ev.cmd = data[offset++];
-				else
-					ev.cmd = parser->rstatus;
+		// Timestamp, followed by a status byte or running status data
+		if (i + 1 >= length) {
+			if (p->sysex && b == 0xF7)
+				midi_in_status(midi, b); // Tolerate EOX sent without timestamp
+			else
+				warn("MIDI I/O: timestamp without MIDI message");
+			break;
 		}
-		memcpy(&(ev.val1), data + offset, ev.len - 1);
-		jack_ringbuffer_write(midi->capture_buffer, &(ev.len), ev.len + 1);
-		offset += ev.len - 1;
+		uint8_t next = data[++i];
+		if (next & 0x80) {
+			midi_in_status(midi, next);
+		} else {
+			if (p->sysex && b == 0xF7)
+				midi_in_status(midi, b); // Tolerate EOX sent without timestamp
+			else if (!p->sysex)
+				p->msg_pos = 0; // Timestamp starts a new running status message
+			midi_in_data(midi, next);
+		}
 	}
 }
 
@@ -442,6 +577,9 @@ static int midi_accept(struct btd_service *service)
 
 	io_set_read_handler(midi->io, midi_write_cb, midi, NULL);
 
+	memset(&midi->midi_in, 0, sizeof(midi->midi_in)); // Forget any previous connection's state
+	midi->playback_dropped = 0;
+
 	midi->db = gatt_db_ref(db);
 	midi->client = bt_gatt_client_ref(client);
 
@@ -533,7 +671,6 @@ static struct btd_profile midi_profile = {
 static int jack_process(jack_nframes_t nFrames, void *pArgs) {
 	jack_mutex = true;
 
-	struct midi_event_t ev;
 	jack_midi_event_t jev;
 	for (int i = 0; i < MAX_DEVICES; ++i) {
 		// Iterate each BLE device
@@ -542,34 +679,38 @@ static int jack_process(jack_nframes_t nFrames, void *pArgs) {
 		struct midi *midi = midis[i];
 
 		// Process messages from BLE device, sending to jack
-		void* capture_buffer = jack_port_get_buffer(midi->capture_port, nFrames);
-		jack_midi_clear_buffer(capture_buffer);
-		while (true) {
-			if (jack_ringbuffer_read(midi->capture_buffer, &(ev.len), 1) != 1)
-				break; // No more data in ring buffer
-			if (jack_ringbuffer_read(midi->capture_buffer, &(ev.cmd), ev.len) != ev.len)
-				break; // MIDI data seems to be missing!
-			if(jack_midi_event_write(capture_buffer, 0, &ev.cmd, ev.len)) {
-				error("Insufficient space in jack MIDI buffer");
-				break;
+		if (midi->capture_port) {
+			void* capture_buffer = jack_port_get_buffer(midi->capture_port, nFrames);
+			jack_midi_clear_buffer(capture_buffer);
+			bool empty = true;
+			uint16_t len;
+			while ((len = rb_next_msg_len(midi->capture_buffer))) {
+				jack_midi_data_t *dst = jack_midi_event_reserve(capture_buffer, 0, len);
+				if (!dst && !empty)
+					break; // jack buffer full - send the rest next period
+				jack_ringbuffer_read_advance(midi->capture_buffer, sizeof(len));
+				if (dst)
+					jack_ringbuffer_read(midi->capture_buffer, (char *)dst, len);
+				else
+					jack_ringbuffer_read_advance(midi->capture_buffer, len); // Never fits
+				empty = false;
 			}
-			//!@todo Peek the data from ringbuffer then remove if able to write to jack
 		}
 
 		// Process messages from jack, sending to BLE device
-		void* playback_buffer = jack_port_get_buffer(midi->playback_port, nFrames);
-		uint64_t count = jack_midi_get_event_count(playback_buffer);
-		for (jack_nframes_t i = 0; i < count; ++i) {
-			if(jack_midi_event_get(&jev, playback_buffer, i))
-				continue;
-			if (jev.size < 4) {
-				uint8_t len = jev.size;
-				jack_ringbuffer_write(midi->playback_buffer, &len, 1);
-				jack_ringbuffer_write(midi->playback_buffer, jev.buffer, jev.size);
+		if (midi->playback_port) {
+			void* playback_buffer = jack_port_get_buffer(midi->playback_port, nFrames);
+			uint64_t count = jack_midi_get_event_count(playback_buffer);
+			for (uint32_t j = 0; j < count; ++j) {
+				if (jack_midi_event_get(&jev, playback_buffer, j))
+					continue;
+				if (jev.size > MIDI_MAX_EVENT_SIZE ||
+				    !rb_queue_msg(midi->playback_buffer, jev.buffer, jev.size))
+					__atomic_add_fetch(&midi->playback_dropped, 1, __ATOMIC_RELAXED);
 			}
+			if (count)
+				write(midi->fd, &count, sizeof(uint64_t));
 		}
-		if (count)
-			write(midi->fd, &count, sizeof(uint64_t));
 	}
 
 	jack_mutex = false;
